@@ -2344,11 +2344,12 @@ def server(
                 ui.input_selectize(
                     "product_query",
                     "",
-                    choices=choices,
-                    selected=None,
+                    choices={"": "", **choices},
+                    selected="",
                     multiple=False,
                     options={
                         "placeholder": t("search_placeholder", lang),
+                        "allowEmptyOption": True,
                         "create": True,
                         "createOnBlur": True,
                         "persist": False,
