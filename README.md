@@ -1,301 +1,121 @@
-# Your Skinfluencer
+# Skinfluencer
 
-Your Skinfluencer is a data-preparation pipeline and local Shiny application for exploring beauty influencers' product opinions.
+Skinfluencer collects beauty content, extracts canonical products and YouTube review opinions, enriches products with verified purchase links/images/stock, stores the result in SQLite, and serves a Shiny discovery UI.
 
-The pipeline downloads YouTube video metadata, full descriptions, and transcripts; extracts canonical product names from descriptions; matches those products to noisy automatic transcripts; generates grounded, conversational summaries; and stores approved results in SQLite. The end-user application reads only from SQLite and does **not** call an LLM during search.
-
-## Why this approach?
-
-Automatic YouTube transcripts often distort beauty brand and product names. A transcript may render a known product as a phonetic approximation, making transcript-only product discovery unreliable.
-
-This project uses the video's own description as the product catalog for that video:
+## Refactored architecture
 
 ```text
-YouTube description -> canonical product candidates
-YouTube transcript  -> product-specific opinions and evidence
-                       |
-                       v
-               approved / review / rejected
-                       |
-                       v
-                    SQLite
-                       |
-                       v
-                 Shiny application
+pipeline.py                  # single CLI entry point
+src/skinfluencer/
+  sources/                   # YouTube / TikTok / Instagram boundaries
+  extraction/                # product + opinion extraction
+  enrichment/                # purchase links + product images/stock
+  storage/                   # SQLite builder/importers + schema
+  config/                    # paths + influencer configuration
+  models/                    # shared content models
+  web/
+    app.py                   # Shiny orchestration only
+    queries.py               # DB/search/query layer
+    components/              # product/review/social/filter UI components
+    static/                  # Shiny static assets and product images
+scripts/legacy/              # pre-refactor scripts retained temporarily
 ```
 
-This separation improves product-name accuracy while preserving the influencer's original transcript evidence.
+The original top-level script names remain as compatibility wrappers. New work should use `pipeline.py`.
 
-## Features
-
-- Downloads complete YouTube descriptions and transcripts without downloading video or audio.
-- Uses a transcript fallback when the primary transcript request fails.
-- Extracts beauty products from unstructured descriptions with OpenAI Structured Outputs.
-- Matches canonical description products to noisy automatic transcript mentions.
-- Produces conversational Turkish summaries grounded in exact transcript excerpts.
-- Classifies each result as `approved`, `review`, or `rejected`.
-- Stores approved comments in SQLite and preserves unresolved records separately.
-- Searches by brand, full product name, approximate spelling, and selected Turkish/English aliases.
-- Runs the user-facing application without OpenAI API calls.
-
-## Current creators
-
-- Naturally Serein
-- Yağmur Vardar
-
-The pipeline is creator-agnostic: additional channels can be processed with the same commands.
-
-## Repository structure
-
-```text
-.
-├── app.py
-├── build_sqlite_database.py
-├── download_youtube_data.py
-├── extract_description_products_openai.py
-├── extract_transcript_product_comments_openai.py
-├── schema.sql
-├── requirements.txt
-├── .env.example
-├── .gitignore
-└── data/
-    └── .gitkeep
-```
-
-Generated files under `data/` are intentionally excluded from version control.
-
-## Requirements
-
-- Python 3.11 or newer
-- An OpenAI API key for preprocessing
-- Internet access for YouTube ingestion and preprocessing
-
-SQLite is included with Python; a separate database server is not required.
-
-## Installation
+## Install
 
 ```bash
-git clone <your-repository-url>
-cd <your-repository-folder>
-
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-
 cp .env.example .env
 ```
 
-Add your API key to `.env`:
+Keep `OPENAI_API_KEY` and any model setting in `.env`; secrets are not committed.
 
-```text
-OPENAI_API_KEY=your_openai_api_key
-OPENAI_MODEL=gpt-5-mini
-```
-
-Never commit `.env` or an API key.
-
-## Pipeline
-
-### 1. Download metadata, descriptions, and transcripts
-
-Naturally Serein:
+## Unified pipeline
 
 ```bash
-python download_youtube_data.py \
-  --channel-url "https://www.youtube.com/@NaturallySerein/videos" \
-  --influencer naturally_serein
+python pipeline.py collect --platform tiktok --influencer naturally_serein
+python pipeline.py collect --platform all
+python pipeline.py extract-products --platform all
+python pipeline.py extract-caption-context --platform tiktok
+python pipeline.py extract-opinions --platform youtube
+python pipeline.py build-database
+python pipeline.py enrich-links
+python pipeline.py enrich-images
+python pipeline.py update --since-last-run
 ```
 
-Yağmur Vardar:
+`update --since-last-run` currently relies on the existing cache/idempotency behavior of collectors and extractors; it does not maintain a separate scheduler state table. Instagram has a module boundary but collection is intentionally disabled until the caption collector is implemented.
+
+For an incremental Instagram run from existing metadata:
 
 ```bash
-python download_youtube_data.py \
-  --channel-url "https://www.youtube.com/@yagmurvardar/videos" \
-  --influencer yagmurvardar
+python pipeline.py ingest-instagram --influencer naturally_serein --dateafter 2026-09-10 --model gpt-4.1-mini
 ```
 
-The downloader creates:
+This resumes unchanged extraction caches, requires successful outputs for every valid
+post in the window, and imports Instagram posts/products and cross-platform relations
+on one disposable database before creating a consistent production backup and activating
+the verified copy. It preserves the legacy alternate-link table and does not rebuild
+YouTube or TikTok. Use `--skip-extraction --dry-run` to verify completed caches without
+API calls or production changes; use `--skip-extraction` to resume only the import stages.
 
-```text
-data/<influencer>/
-├── metadata/
-├── transcripts/
-├── downloaded_videos.json
-├── failures.json
-└── summary.json
-```
-
-Metadata is saved before transcript retrieval. If transcript retrieval fails, the complete video description is still preserved and the video can be retried later.
-
-Useful options:
+## Run the app
 
 ```bash
-python download_youtube_data.py --help
+shiny run --reload app.py
 ```
 
-For example, to retry every eligible video:
+The root `app.py` is a thin compatibility launcher for `src/skinfluencer/web/app.py`.
+
+## Safety / database behavior
+
+- Existing SQLite data is preserved by the migrated builder logic.
+- TikTok social-product import remains separate internally and is invoked after the main DB build.
+- `python pipeline.py build-database --dry-run` works on a temporary SQLite backup and leaves the production DB unchanged.
+- Purchase-link verification and product-image/stock enrichment retain their existing logic.
+- Existing `www/...` image paths remain compatible: static files now live under `src/skinfluencer/web/static/` and the query layer resolves legacy `www/` prefixes.
+
+## Tests
 
 ```bash
-python download_youtube_data.py \
-  --channel-url "https://www.youtube.com/@NaturallySerein/videos" \
-  --influencer naturally_serein \
-  --force
+python -m pytest -q
 ```
 
-### 2. Extract canonical products from descriptions
+The original TikTok regression test is retained under `scripts/legacy/test_tiktok_pipeline.py` for reference while the new test suite is migrated incrementally.
+
+## Caption context extraction (TikTok / future Instagram)
+
+Social captions are now a second semantic source in addition to YouTube transcripts. The
+product extractor still decides *which product is explicitly named*. A separate context stage
+then asks only what the same caption says about those already-approved products.
 
 ```bash
-python extract_description_products_openai.py \
-  --influencer naturally_serein
+# Preview how many cached TikTok product posts would need a context API call
+python pipeline.py extract-caption-context --platform tiktok \
+  --influencer yagmurvardar --model gpt-4.1-mini --dry-run
+
+# Process one post first
+python pipeline.py extract-caption-context --platform tiktok \
+  --influencer yagmurvardar --video-id 7680159915989585172 \
+  --model gpt-4.1-mini
+
+# Then import the cached context into SQLite
+python pipeline.py build-database
 ```
 
-```bash
-python extract_description_products_openai.py \
-  --influencer yagmurvardar
-```
+Context output is cached under
+`data/<influencer>/tiktok/caption_context_llm/`. It never creates new products. It can store
+recommendation/opinion/comparison/routine context, multiple audience or skin-type contexts,
+a short Turkish caption-grounded summary, caption-supported evidence, and confidence. The model returns
+compact semantic groups (for example one group for a skin-type recommendation section), which are
+expanded deterministically per product to reduce output tokens. Low-confidence
+or unsupported claims are not surfaced as recommendations. The Shiny UI explicitly labels these
+summaries as caption-derived rather than transcript-derived.
 
-Output:
-
-```text
-data/<influencer>/description_products_llm/
-```
-
-Each extracted product includes an exact evidence excerpt from the original video description. Products without exact evidence or a reliable brand remain in review status.
-
-### 3. Extract grounded product comments from transcripts
-
-```bash
-python extract_transcript_product_comments_openai.py \
-  --influencer naturally_serein
-```
-
-```bash
-python extract_transcript_product_comments_openai.py \
-  --influencer yagmurvardar
-```
-
-Output:
-
-```text
-data/<influencer>/product_mentions_llm_final_v2/
-```
-
-The extractor does not discover new canonical products. It receives a fixed candidate list from the description stage and determines whether each product is reviewed, merely mentioned, or unsupported by the transcript.
-
-For every validated review it stores:
-
-- canonical brand and product name;
-- noisy transcript product mention;
-- conversational display summary;
-- sentiment;
-- exact transcript evidence;
-- confidence and validation status.
-
-### 4. Build the SQLite database
-
-```bash
-python build_sqlite_database.py \
-  --influencer naturally_serein \
-  --influencer yagmurvardar \
-  --reset
-```
-
-Output:
-
-```text
-data/database/skinfluencer.sqlite
-```
-
-Database behavior:
-
-- `approved` results are added to the searchable application tables;
-- `review` and `rejected` results are retained in `unresolved_mentions`;
-- imports are idempotent and do not duplicate the same product/video record;
-- a newly generated extraction for a video replaces that video's previous imported rows.
-
-### 5. Run the Shiny application
-
-```bash
-shiny run --reload --launch-browser app.py
-```
-
-The application supports:
-
-- influencer selection;
-- brand-aware product autocomplete;
-- fuzzy matching for approximate names and minor spelling mistakes;
-- aliases such as `güneş kremi`, `sun cream`, and `sunscreen`;
-- conversational influencer summaries;
-- sentiment, source video, confidence, and transcript evidence.
-
-The application reads SQLite in read-only mode and does not call OpenAI.
-
-## Example
-
-A description may contain the canonical product:
-
-```text
-La Roche-Posay - Effaclar Azelaic Acid Serum
-```
-
-The automatic transcript may contain a distorted mention such as:
-
-```text
-Laro Pos'in efektler... azalik asit serumu
-```
-
-Because the product catalog comes from the description, the transcript stage can match the noisy mention to the correct product and extract only the evidence-backed opinion.
-
-## Data model
-
-Main SQLite tables:
-
-- `influencers`
-- `videos`
-- `products`
-- `product_mentions`
-- `unresolved_mentions`
-- `import_runs`
-
-The `approved_product_comments` view powers the Shiny application.
-
-## Cost model
-
-OpenAI is used only during offline preprocessing:
-
-- description product extraction;
-- transcript-product matching;
-- grounded summary and sentiment extraction.
-
-Search, autocomplete, SQLite queries, and normal application use do not create OpenAI API costs.
-
-## Privacy and repository hygiene
-
-Do not commit:
-
-- `.env`;
-- API keys;
-- raw transcripts or metadata;
-- generated LLM outputs;
-- local SQLite databases.
-
-The included `.gitignore` excludes these files by default.
-
-## Limitations
-
-- Product lists in descriptions may include alternatives that are not meaningfully reviewed in the transcript; these are rejected at the transcript stage.
-- Automatic captions can still be unavailable or temporarily rate-limited.
-- `review` results require manual inspection before they should be exposed to users.
-- Product names are grounded in the video's description and are not independently verified against a live retail catalog.
-
-## Roadmap
-
-- Add more Turkish and international beauty creators.
-- Add a manual review dashboard for unresolved records.
-- Add product aliases and canonical catalog maintenance tools.
-- Add PostgreSQL support for deployment.
-- Add tests and a modular package structure under `src/skinfluencer/`.
-
-## Disclaimer
-
-The application summarizes public influencer statements. It does not provide medical or dermatological advice. Product suitability varies by person, and source videos should be consulted for full context.
+`pipeline.py update` now runs this stage after social product extraction and before the database
+build. Instagram uses the same intended abstraction, but its collector/extractor remains disabled
+until Instagram ingestion is implemented.

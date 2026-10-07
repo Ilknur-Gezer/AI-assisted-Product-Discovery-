@@ -1,0 +1,58 @@
+{
+  "instructions": "brand_domains alanına yalnızca kesinliği doğrulanmış resmi marka domainlerini ekleyin. Protokol ve yol yazmayın; örnek: \"Round Lab\": [\"roundlab.com\"].",
+  "brand_domains": {},
+  "preferred_retailers": [
+    {
+      "slug": "gratis",
+      "display_name": "Gratis",
+      "domains": [
+        "gratis.com"
+      ]
+    },
+    {
+      "slug": "watsons",
+      "display_name": "Watsons",
+      "domains": [
+        "watsons.com.tr"
+      ]
+    },
+    {
+      "slug": "rossmann",
+      "display_name": "Rossmann",
+      "domains": [
+        "rossmann.com.tr"
+      ]
+    },
+    {
+      "slug": "korendy",
+      "display_name": "Korendy",
+      "domains": [
+        "korendy.com.tr"
+      ]
+    },
+    {
+      "slug": "sephora",
+      "display_name": "Sephora",
+      "domains": [
+        "sephora.com.tr"
+      ]
+    }
+  ],
+  "blocked_domains": [
+    "amazon.com",
+    "amazon.com.tr",
+    "ebay.com",
+    "facebook.com",
+    "hepsiburada.com",
+    "instagram.com",
+    "pinterest.com",
+    "reddit.com",
+    "tiktok.com",
+    "trendyol.com",
+    "twitter.com",
+    "wikipedia.org",
+    "x.com",
+    "youtu.be",
+    "youtube.com"
+  ]
+}

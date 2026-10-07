@@ -1,1 +1,10 @@
-shiny>=1.7,<2
+beautifulsoup4
+ddgs>=9
+openai
+Pillow
+pydantic>=2
+python-dotenv
+requests
+shiny
+yt-dlp
+youtube-transcript-api

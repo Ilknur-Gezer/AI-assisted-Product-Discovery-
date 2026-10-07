@@ -18,6 +18,7 @@ env/
 .env
 .env.*
 !.env.example
+.secrets/
 
 # Local data and generated outputs
 data/*
