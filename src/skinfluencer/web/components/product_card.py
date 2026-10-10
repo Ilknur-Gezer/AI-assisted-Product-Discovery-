@@ -171,15 +171,20 @@ def retailer_links(
 
     for row in selected_rows:
         merchant_slug = str(row["merchant_slug"])
-        if merchant_slug in seen_merchants:
+        variant = row.get('variant_label') if isinstance(row, dict) else None
+        merchant_key = f"{merchant_slug}:{variant or ''}"
+        if merchant_key in seen_merchants:
             continue
-        seen_merchants.add(merchant_slug)
+        seen_merchants.add(merchant_key)
 
         label = (
             t("official_site", lang, brand=product["brand"])
             if row["link_type"] == "official_brand"
             else str(row["merchant_name"])
         )
+
+        if variant:
+            label += f" · Shade {variant}"
 
         stock_status = str(row["stock_status"] or "unknown")
         stock_key = {"in_stock": "in_stock", "out_of_stock": "out_of_stock", "limited_stock": "limited_stock"}.get(stock_status)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import unicodedata
 from datetime import datetime, timezone
@@ -62,6 +63,53 @@ def normalize_text(value: str | None) -> str:
         if not unicodedata.combining(character)
     )
     return " ".join(ascii_like.casefold().split()).strip()
+
+
+def product_identity_key(brand: str | None, product_name: str | None) -> str:
+    """Yazım farklarına dayanıklı ürün kimliği.
+
+    Noktalama, &/+ işaretleri, ™/®, kelime sırası, marka boşlukları, "15 ml" ile
+    "15ml" farkı ve baştaki sıfırları (003 == 03) yok sayar. Ton/numara tokenları
+    anahtarda kalır (02M != 03M) ve sondaki '+' korunur (B5 != B5+).
+    """
+    def prep(value):
+        value = re.sub(r"[™®©℠\ufe0f]", "", value or "")
+        value = value.replace("%", " pct ").replace("&", " and ")
+        value = re.sub(r"(?<=\w)\+(?=\w)", " and ", value)   # Lift+Sculpt
+        value = re.sub(r"\s\+\s", " and ", value)             # Ginseng + Retinal
+        value = value.replace("+", " plus ")                    # B5+, SPF50+
+        text = re.sub(r"[^a-z0-9 ]", " ", normalize_text(value))
+        return re.sub(r"(?<=\d)\s+(?=(?:cc|ml|gr|g|mg|oz)\b)", "", text)
+
+    brand_part = prep(brand).replace(" ", "")
+    tokens = [t for t in prep(product_name).split() if t not in {"and", "ve", "the"}]
+    tokens = [(t.lstrip("0") or "0") if t.isdigit() else t for t in tokens]
+    return f"{brand_part}|{' '.join(sorted(tokens))}"
+
+
+def find_product_row(connection, brand, product_name):
+    """Resolve an approved catalog product, including pre-merge name aliases.
+
+    Never create a product here. New discoveries enter the pending CSV workflow.
+    """
+    norm_brand, norm_name = normalize_text(brand), normalize_text(product_name)
+    row = connection.execute(
+        "SELECT id FROM products WHERE normalized_brand=? AND normalized_product_name=? "
+        "AND verification_status='approved'", (norm_brand, norm_name)
+    ).fetchone()
+    if row is not None:
+        return row
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='product_aliases'").fetchone():
+        row = connection.execute(
+            "SELECT p.id FROM product_aliases a JOIN products p ON p.id=a.canonical_product_id "
+            "WHERE a.normalized_brand=? AND a.normalized_product_name=? "
+            "AND p.verification_status='approved'", (norm_brand, norm_name)
+        ).fetchone()
+        if row is not None: return row
+    return connection.execute(
+        "SELECT id FROM products WHERE identity_key=? AND verification_status='approved' "
+        "ORDER BY id LIMIT 1", (product_identity_key(brand, product_name),)
+    ).fetchone()
 
 
 def format_upload_date(value: str | None) -> str | None:
@@ -468,62 +516,11 @@ def upsert_video(
     return int(row["id"])
 
 
-def upsert_product(
-    connection: sqlite3.Connection,
-    *,
-    brand: str,
-    product_name: str,
-    category: str,
-) -> int:
-    normalized_brand = normalize_text(brand)
-    normalized_product_name = normalize_text(product_name)
-    search_text = normalize_text(f"{brand} {product_name}")
-
-    connection.execute(
-        """
-        INSERT INTO products (
-            brand,
-            product_name,
-            category,
-            normalized_brand,
-            normalized_product_name,
-            search_text,
-            verification_status,
-            updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, 'approved', CURRENT_TIMESTAMP)
-        ON CONFLICT(normalized_brand, normalized_product_name) DO UPDATE SET
-            brand = excluded.brand,
-            product_name = excluded.product_name,
-            category = CASE
-                WHEN products.category = 'other_beauty'
-                     AND excluded.category <> 'other_beauty'
-                THEN excluded.category
-                ELSE products.category
-            END,
-            search_text = excluded.search_text,
-            verification_status = 'approved',
-            updated_at = CURRENT_TIMESTAMP
-        """,
-        (
-            brand,
-            product_name,
-            category,
-            normalized_brand,
-            normalized_product_name,
-            search_text,
-        ),
-    )
-    row = connection.execute(
-        """
-        SELECT id
-        FROM products
-        WHERE normalized_brand = ? AND normalized_product_name = ?
-        """,
-        (normalized_brand, normalized_product_name),
-    ).fetchone()
-    assert row is not None
-    return int(row["id"])
+def upsert_product(connection: sqlite3.Connection, *, brand: str,
+                   product_name: str, category: str) -> int | None:
+    """Legacy API name; match only. Unknown products MUST NOT be auto-inserted."""
+    row = find_product_row(connection, brand, product_name)
+    return int(row['id']) if row else None
 
 
 def import_approved_mention(
@@ -557,6 +554,9 @@ def import_approved_mention(
         product_name=product_name,
         category=category,
     )
+
+    if product_id is None:
+        return False
 
     connection.execute(
         """
@@ -627,6 +627,7 @@ def import_approved_mention(
             source_file,
         ),
     )
+    return True
 
 
 def import_unresolved_mention(
@@ -761,7 +762,7 @@ def import_video_payload(
     for mention in mentions:
         status = str(mention.get("status") or "review")
         if status == "approved":
-            import_approved_mention(
+            attached = import_approved_mention(
                 connection,
                 influencer_id=influencer_id,
                 video_id=video_id,
@@ -769,7 +770,15 @@ def import_video_payload(
                 payload=payload,
                 source_file=str(source_path),
             )
-            approved_count += 1
+            if attached:
+                approved_count += 1
+            else:
+                pending = dict(mention, status='review',
+                               status_reason='pending_canonical_approval')
+                import_unresolved_mention(
+                    connection, influencer_id=influencer_id,
+                    video_id=video_id, mention=pending, source_file=str(source_path))
+                unresolved_count += 1
         else:
             import_unresolved_mention(
                 connection,
@@ -852,17 +861,15 @@ def import_purchase_link_records(
                 record.get("domain") or parsed.hostname
             ).casefold().removeprefix("www.")
 
-            product_row = connection.execute(
-                """
-                SELECT id
-                FROM products
-                WHERE normalized_brand = ?
-                  AND normalized_product_name = ?
-                """,
-                (normalize_text(brand), normalize_text(product_name)),
-            ).fetchone()
+            product_row = find_product_row(connection, brand, product_name)
             if product_row is None:
                 raise ValueError("Ürün SQLite kataloğunda bulunamadı.")
+            first_link = connection.execute(
+                "SELECT merchant_slug,url FROM purchase_links WHERE product_id=? ORDER BY id LIMIT 1",
+                (int(product_row['id']),),
+            ).fetchone()
+            if first_link and (first_link['merchant_slug'],first_link['url']) != (merchant_slug,url):
+                continue  # Single purchase link per product, per agreed simple rule.
 
             confidence_value = record.get("match_confidence")
             confidence = (
@@ -1005,15 +1012,7 @@ def import_product_image_records(
                     f"Geçersiz verification_status: {verification_status}"
                 )
 
-            product_row = connection.execute(
-                """
-                SELECT id
-                FROM products
-                WHERE normalized_brand = ?
-                  AND normalized_product_name = ?
-                """,
-                (normalize_text(brand), normalize_text(product_name)),
-            ).fetchone()
+            product_row = find_product_row(connection, brand, product_name)
             if product_row is None:
                 raise ValueError("Ürün SQLite kataloğunda bulunamadı.")
 
@@ -1160,6 +1159,11 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    # Never overwrite a finalized catalog by rebuilding from raw extraction files.
+    if args.reset and args.database.exists():
+        with sqlite3.connect(args.database) as existing:
+            if existing.execute("SELECT 1 FROM sqlite_master WHERE name='product_aliases'").fetchone():
+                raise SystemExit('--reset is forbidden on the canonicalized database')
 
     requested_source_subdirs = list(dict.fromkeys(args.source_subdirs))
 
@@ -1255,6 +1259,15 @@ def main() -> None:
             for source_dir in source_dirs:
                 for source_path, payload in iter_source_payloads(source_dir):
                     files_seen += 1
+                    # Incremental by default: existing videos already contain review
+                    # translations; replacing them would cascade-delete translations.
+                    existing_video = connection.execute(
+                        "SELECT 1 FROM videos v JOIN influencers i ON i.id=v.influencer_id "
+                        "WHERE i.slug=? AND v.youtube_video_id=?",
+                        (slug, str(payload.get('video_id') or '')),
+                    ).fetchone()
+                    if existing_video:
+                        continue
                     try:
                         with connection:
                             approved_count, unresolved_count = import_video_payload(
@@ -1288,36 +1301,9 @@ def main() -> None:
             with connection:
                 restore_social(connection, preserved_social)
 
-        # Preserve products referenced by social posts as well as YouTube mentions.
+        # The CSV canonical catalog is authoritative; do NOT delete catalog
+        # products just because no current review/link points to them.
         with connection:
-            connection.execute(
-            """
-            DELETE FROM products
-            WHERE id NOT IN (
-                SELECT DISTINCT product_id
-                FROM product_mentions
-
-                UNION
-
-                SELECT product_id
-                FROM social_post_products
-                WHERE product_id IS NOT NULL
-
-                UNION
-
-                SELECT product_id
-                FROM purchase_links
-                WHERE product_id IS NOT NULL
-
-                UNION
-
-                SELECT product_id
-                FROM product_images
-                WHERE product_id IS NOT NULL
-            )
-            """
-        )
-
             external_purchase_links = load_purchase_link_records(
                 args.purchase_links
             )

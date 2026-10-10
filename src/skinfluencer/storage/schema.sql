@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS products (
     normalized_brand TEXT NOT NULL,
     normalized_product_name TEXT NOT NULL,
     search_text TEXT NOT NULL,
+    identity_key TEXT,
     verification_status TEXT NOT NULL DEFAULT 'approved'
         CHECK (verification_status IN ('approved', 'review', 'rejected')),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -494,3 +495,17 @@ CREATE INDEX IF NOT EXISTS idx_outbound_clicks_clicked_at
     ON outbound_clicks(clicked_at);
 
 PRAGMA user_version = 9;
+
+
+-- Canonical catalog aliases and former product-ID redirect map.
+CREATE TABLE IF NOT EXISTS product_aliases (
+    normalized_brand TEXT NOT NULL,
+    normalized_product_name TEXT NOT NULL,
+    canonical_product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    PRIMARY KEY(normalized_brand,normalized_product_name)
+);
+CREATE INDEX IF NOT EXISTS idx_product_aliases_target ON product_aliases(canonical_product_id);
+CREATE TABLE IF NOT EXISTS product_id_redirects (
+    old_product_id INTEGER PRIMARY KEY,
+    canonical_product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE
+);

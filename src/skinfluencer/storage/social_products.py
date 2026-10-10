@@ -477,17 +477,12 @@ def validate_products(items, caption):
 
 
 def product_id_for(connection, item):
-    key = (normalize(item['brand']), normalize(item['product_name']))
-    row = connection.execute('SELECT id, verification_status FROM products WHERE normalized_brand=? AND normalized_product_name=?', key).fetchone()
+    """Return canonical match only; stage unknown items instead of creating IDs."""
+    from .sqlite_importer import find_product_row
+    row = find_product_row(connection, item['brand'], item['product_name'])
     if row:
-        if row['verification_status'] != 'approved':
-            return None, 'catalog_requires_review'
-        return row['id'], 'exact_normalized'
-    cursor = connection.execute('''INSERT INTO products
-        (brand,product_name,category,normalized_brand,normalized_product_name,search_text)
-        VALUES (?,?,?,?,?,?)''', (item['brand'], item['product_name'], item['category'], *key,
-                                 normalize(item['brand']+' '+item['product_name'])))
-    return cursor.lastrowid, 'new_product'
+        return int(row['id']), 'canonical_match'
+    return None, 'pending_canonical_approval'
 
 
 def import_payload(connection, payload, source_file):
@@ -550,7 +545,7 @@ def import_payload(connection, payload, source_file):
         (post_id,),
     )
 
-    counts = {'approved':0,'review':0,'exact_normalized':0,'new_product':0}
+    counts = {'approved':0,'review':0,'canonical_match':0,'pending_canonical_approval':0}
     for item in products:
         pid, method = None, 'review'
         if item['status'] == 'approved':
@@ -558,7 +553,7 @@ def import_payload(connection, payload, source_file):
             if pid is None:
                 item['status'], item['status_reason'] = 'review', method
         counts[item['status']] += 1
-        if method in {'exact_normalized', 'new_product'}:
+        if method in {'canonical_match', 'pending_canonical_approval'}:
             counts[method] += 1
         key = social_candidate_key(item['brand'], item['product_name'])
         connection.execute(

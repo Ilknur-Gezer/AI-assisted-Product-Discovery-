@@ -298,6 +298,10 @@ def get_product_comments(
            AND pmt.language = ?
         WHERE {" AND ".join(conditions)}
         ORDER BY
+            CASE apc.content_type
+                WHEN 'long' THEN 0
+                WHEN 'shorts' THEN 1
+                ELSE 2 END,
             CASE WHEN apc.upload_date IS NULL THEN 1 ELSE 0 END,
             apc.upload_date DESC,
             apc.influencer_name COLLATE NOCASE
@@ -310,7 +314,7 @@ def get_social_posts(
     product_id: int,
     influencer_slug: str,
     lang: str = "tr",
-) -> list[sqlite3.Row]:
+) -> list[dict[str, Any]]:
     language = normalize_language(lang)
     conditions = ["asl.product_id = ?"]
     params: list[Any] = [language, product_id]
@@ -319,7 +323,7 @@ def get_social_posts(
         conditions.append("asl.influencer_slug = ?")
         params.append(influencer_slug)
 
-    return fetch_all(
+    rows = fetch_all(
         f"""
         SELECT
             asl.*,
@@ -353,6 +357,21 @@ def get_social_posts(
         """,
         tuple(params),
     )
+
+    from .social_grouping import group_social_posts
+    post_ids = [int(row['social_post_id']) for row in rows]
+    if not post_ids:
+        return []
+    placeholders = ','.join('?' for _ in post_ids)
+    # Near matches additionally require creator/product/date/similarity safeguards.
+    pairs = fetch_all(
+        f"""SELECT post_id_a, post_id_b, match_type, similarity FROM social_post_matches
+            WHERE match_type IN ('exact', 'near')
+              AND post_id_a IN ({placeholders})
+              AND post_id_b IN ({placeholders})""",
+        tuple(post_ids + post_ids),
+    )
+    return group_social_posts(rows, [(p['post_id_a'], p['post_id_b'], p['match_type'], p['similarity']) for p in pairs])
 
 
 # ---------------------------------------------------------------------------
@@ -830,3 +849,91 @@ def search_products_commerce(
         )
     )
     return scored[:limit]
+
+# Explicit, non-destructive product families.
+from .product_families import family_ids as _family_ids, collapse_catalog as _collapse_catalog
+
+def get_family_product_ids(product_id: int) -> list[int]:
+    with connect_readonly() as conn:
+        return _family_ids(conn, product_id)
+
+_original_commerce_catalog = get_commerce_catalog
+_original_product_catalog = get_product_catalog
+_original_get_product_comments = get_product_comments
+_original_get_social_posts = get_social_posts
+_original_get_purchase_links = get_purchase_links
+_original_get_product_by_id = get_product_by_id
+
+def get_commerce_catalog(influencer_slug: str):
+    with connect_readonly() as conn:
+        return _collapse_catalog(conn, _original_commerce_catalog(influencer_slug))
+
+def get_product_catalog(influencer_slug: str):
+    with connect_readonly() as conn:
+        return _collapse_catalog(conn, _original_product_catalog(influencer_slug))
+
+def get_product_by_id(product_id: int):
+    ids = get_family_product_ids(product_id)
+    items = [_original_get_product_by_id(i) for i in ids]
+    items = [i for i in items if i]
+    if not items:
+        return None
+    first = next((x for x in items if x['product_id'] == product_id), items[0]).copy()
+    if len(ids) > 1:
+        with connect_readonly() as conn:
+            f = conn.execute('SELECT f.representative_product_id,f.brand,f.product_name FROM product_family_members m JOIN product_families f ON f.id=m.family_id WHERE m.product_id=?',(product_id,)).fetchone()
+        first.update(product_id=int(f[0]),brand=f[1],product_name=f[2])
+        first['review_count'] = sum(x['review_count'] for x in items)
+        first['social_post_count'] = sum(x['social_post_count'] for x in items)
+        first['influencer_count'] = max(x['influencer_count'] for x in items)
+    return first
+
+def get_product_comments(product_id: int, influencer_slug: str, lang: str='tr'):
+    out = []
+    seen = set()
+    for pid in get_family_product_ids(product_id):
+        for r in _original_get_product_comments(pid,influencer_slug,lang):
+            if r['mention_id'] not in seen:
+                seen.add(r['mention_id'])
+                out.append(r)
+    return sorted(out, key=lambda r: (0 if r['content_type']=='long' else 1 if r['content_type']=='shorts' else 2, -(int(str(r['upload_date'] or '0000').replace('-','')[:8]) if str(r['upload_date'] or '').replace('-','')[:8].isdigit() else 0)))
+
+def get_social_posts(product_id: int, influencer_slug: str, lang: str='tr'):
+    ids = get_family_product_ids(product_id)
+    out=[]
+    for pid in ids:
+        out.extend(_original_get_social_posts(pid,influencer_slug,lang))
+    if len(ids)==1:
+        return out
+    from .social_grouping import group_social_posts
+    by_id={}
+    for row in out:
+        item=dict(row)
+        item['product_id']=product_id
+        by_id.setdefault(int(item['social_post_id']),item)
+    posts=list(by_id)
+    if not posts:
+        return []
+    qs=','.join('?' for _ in posts)
+    pairs=fetch_all(f"SELECT post_id_a,post_id_b,match_type,similarity FROM social_post_matches WHERE match_type IN ('exact','near') AND post_id_a IN ({qs}) AND post_id_b IN ({qs})",tuple(posts+posts))
+    return group_social_posts(list(by_id.values()),[(r['post_id_a'],r['post_id_b'],r['match_type'],r['similarity']) for r in pairs])
+
+def get_purchase_links(product_id: int):
+    out=[]
+    seen=set()
+    ids=get_family_product_ids(product_id)
+    with connect_readonly() as conn:
+        variants={int(r[0]):r[1] for r in conn.execute('SELECT product_id,variant_label FROM product_family_members WHERE product_id IN (%s)' % ','.join('?' for _ in ids),ids)} if len(ids)>1 else {}
+    for pid in ids:
+        for row in _original_get_purchase_links(pid):
+            url=str(row['url']).strip()
+            key=url.rstrip('/').casefold()
+            if key not in seen:
+                seen.add(key)
+                value=dict(row)
+                value['variant_label']=variants.get(pid)
+                out.append(value)
+    return out
+
+# Never suppress an unmapped product card without merging its reviews.
+# Global reconciled family membership is the only deduplication mechanism.

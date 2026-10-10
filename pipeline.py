@@ -257,6 +257,9 @@ def _has_match_json(influencers: list[str]) -> bool:
 
 
 def cmd_build_database(args: argparse.Namespace) -> None:
+    if args.reset:
+        raise SystemExit("--reset disabled on canonical catalog: would lose ID mapping and outbound_clicks. "
+                         "Use the existing incremental import and CSV approval flow.")
     from skinfluencer.storage import sqlite_importer
     from skinfluencer.storage import _tiktok_importer
     from skinfluencer.storage import _instagram_importer
@@ -563,6 +566,14 @@ def _update_one(args: argparse.Namespace, influencer: str) -> None:
         from skinfluencer.storage import platform_match_importer
         run_main(platform_match_importer, ["--influencer", influencer])
 
+    # Mandatory review gate: export non-matching extracted products before state advances.
+    from skinfluencer.storage.pending_products import export as export_pending
+    pending_csv = ROOT / 'reports' / (f'pending_products_{influencer}_{datetime.utcnow():%Y%m%dT%H%M%S%f}.csv')
+    with sqlite3.connect(DATABASE_PATH) as pending_conn:
+        pending_conn.row_factory = sqlite3.Row
+        count = export_pending(pending_conn, pending_csv)
+    print(f"Pending canonical candidates: {count} -> {pending_csv}")
+
     after_db = _db_counts()
     _print_db_delta(before_db, after_db)
 
@@ -586,6 +597,24 @@ def _update_one(args: argparse.Namespace, influencer: str) -> None:
 def cmd_update(args: argparse.Namespace) -> None:
     for influencer in selected_influencers(args.influencer):
         _update_one(args, influencer)
+
+
+def cmd_reconcile_catalog(args: argparse.Namespace) -> None:
+    """Report-only incremental reconciliation; never updates SQLite."""
+    from skinfluencer.storage.catalog_reconciliation import scan, write_report
+    with sqlite3.connect(f"file:{args.database.resolve()}?mode=ro", uri=True) as conn:
+        products, candidates = scan(conn)
+        summary = write_report(args.report_dir, products, candidates)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+def cmd_pending_products(args: argparse.Namespace) -> None:
+    from skinfluencer.storage.pending_products import export, apply
+    with sqlite3.connect(args.database) as conn:
+        conn.row_factory = sqlite3.Row
+        result = export(conn, args.csv) if args.operation == 'export' else apply(conn, args.csv)
+    print(json.dumps({'operation': args.operation, 'result': result, 'csv': str(args.csv)},
+                     ensure_ascii=False, indent=2))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -665,6 +694,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_enrich_images)
+
+    p = sub.add_parser("reconcile-catalog", help="Global product-family candidate report (read-only)")
+    p.add_argument("--database", type=Path, default=DATABASE_PATH)
+    p.add_argument("--report-dir", type=Path, default=ROOT / "reports" / "catalog_reconciliation")
+    p.set_defaults(func=cmd_reconcile_catalog)
+
+    p = sub.add_parser('pending-products', help='Export CSV queue or apply explicitly approved mapping')
+    p.add_argument('operation', choices=['export', 'apply'])
+    p.add_argument('--database', type=Path, default=DATABASE_PATH)
+    p.add_argument('--csv', type=Path, default=ROOT / 'reports' / 'pending_products.csv')
+    p.set_defaults(func=cmd_pending_products)
 
     p = sub.add_parser("update", help="Incremental TikTok + Instagram update")
     p.add_argument("--influencer", choices=influencer_slugs())

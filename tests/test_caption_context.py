@@ -214,6 +214,16 @@ def test_context_cache_imports_into_social_view():
         ],
     }
 
+    # The catalog is approval-gated: the product must already exist to be approved.
+    from skinfluencer.storage.sqlite_importer import normalize_text, product_identity_key
+    brand = 'Shiseido'
+    name = 'Expert Sun Protector Lotion SPF50+'
+    connection.execute('''INSERT INTO products (brand,product_name,category,normalized_brand,
+        normalized_product_name,search_text,identity_key,verification_status)
+        VALUES (?,?,?,?,?,?,?,'approved')''',
+        (brand,name,'skincare',normalize_text(brand),normalize_text(name),
+         normalize_text(brand+' '+name),product_identity_key(brand,name)))
+
     import_payload(
         connection,
         product_payload,

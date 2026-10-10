@@ -5,7 +5,7 @@ import sqlite3
 from typing import Any
 from shiny import App, Inputs, Outputs, Session, reactive, render, ui
 from ..config.settings import DATABASE_PATH, STATIC_DIR
-from .queries import (browse_products, database_ready, get_commerce_catalog, get_product_by_id, get_product_comments, get_purchase_links, get_social_posts, get_influencer_id, influencer_choices, influencer_display_name, product_matches_category, search_products_commerce)
+from .queries import (browse_products, database_ready, get_commerce_catalog, get_product_by_id, get_product_comments, get_purchase_links, get_social_posts, get_influencer_id, influencer_choices, influencer_display_name, product_matches_category, search_products_commerce, get_family_product_ids)
 from .components.product_card import (creator_platform_icons, payload_as_dict, platform_icon, product_card, product_creator_presence, product_visual, retailer_links)
 from .components.influencer_selector import category_tabs_ui, influencer_selector_ui
 from .analytics import track_event
@@ -2049,7 +2049,7 @@ def short_form_context(posts: list[Any], lang: str = "tr") -> Any:
         copy = (opinion or summary) if has_context else t("product_in_caption", lang)
 
         links: list[Any] = []
-        tiktok_url = str(_row_value(post, "original_url", "") or "").strip()
+        tiktok_url = str(_row_value(post, "tiktok_url", "") or "").strip()
         if tiktok_url:
             links.append(
                 ui.tags.a(
@@ -2099,7 +2099,11 @@ def short_form_context(posts: list[Any], lang: str = "tr") -> Any:
 def product_detail_page(product: dict[str, Any], influencer_slug: str, lang: str = "tr") -> Any:
     lang = normalize_language(lang)
     product_id = int(product["product_id"])
-    creators = product_creator_presence(product_id, "all")
+    creators_by_slug = {}
+    for member_id in get_family_product_ids(product_id):
+        for creator in product_creator_presence(member_id, "all"):
+            creators_by_slug[str(creator["slug"])] = creator
+    creators = list(creators_by_slug.values())
     creator_slugs = {str(creator["slug"]) for creator in creators}
     if influencer_slug not in creator_slugs and creators:
         influencer_slug = str(creators[0]["slug"])
@@ -2341,21 +2345,23 @@ def server(
                 onclick="Shiny.setInputValue('home_request',Date.now(),{priority:'event'});",
             ),
             ui.div(
-                ui.input_selectize(
-                    "product_query",
-                    "",
-                    choices={"": "", **choices},
-                    selected="",
-                    multiple=False,
-                    options={
-                        "placeholder": t("search_placeholder", lang),
-                        "allowEmptyOption": True,
-                        "create": True,
-                        "createOnBlur": True,
-                        "persist": False,
-                        "maxOptions": 180,
-                        "closeAfterSelect": True,
-                    },
+                ui.div(
+                    ui.input_text(
+                        "product_query",
+                        "",
+                        value="",
+                        placeholder=t("search_placeholder", lang),
+                    ),
+                    # Delegate Enter from the text field to the existing Search button.
+                    # Click only when focus is on this input; no autocomplete is shown.
+                    onkeydown=(
+                        "if(event.key==='Enter' && event.target.id==='product_query'){"
+                        "event.preventDefault();"
+                        "const btn=document.getElementById('search_button');"
+                        "if(btn) btn.click();"
+                        "}"
+                    ),
+                    class_="plain-search-field",
                 ),
                 ui.input_action_button(
                     "search_button",
